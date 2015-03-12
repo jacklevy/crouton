@@ -5,7 +5,7 @@
 REQUIRES='x11'
 DESCRIPTION='Installs cmt binaries from Chromium OS host as touchpad driver.'
 CHROOTBIN='croutonwheel croutonwheel-autostart'
-CHROOTETC='croutonwheel.desktop cmt-xorg.conf'
+CHROOTETC='cmt-xorg.conf'
 . "${TARGETSDIR:="$PWD"}/common"
 
 ### Append to prepare.sh:
@@ -18,9 +18,9 @@ CHROMIUM_CMT=/var/host/cmt
 CROUTON_ETC=/etc/crouton
 ln -sf $CHROMIUM_CMT $CROUTON_ETC
 
-# deploy croutonwheel.desktop symlink to start croutonwheel when X starts
-mkdir -p /etc/xdg/autostart
-ln -sf $CROUTON_ETC/croutonwheel.desktop /etc/xdg/autostart/croutonwheel.desktop
+# remove old croutonwheel.desktop and symlink to prevent conflict with
+# croutonxinitrc-wrapper
+rm -f $CROUTON_ETC/croutonwheel.desktop /etc/xdg/autostart/croutonwheel.desktop
 
 # for trusty, bypass the ABI mismatch error
 ln -sf $CROUTON_ETC/cmt-xorg.conf /etc/X11/xorg.conf

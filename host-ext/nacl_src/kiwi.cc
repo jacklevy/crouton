@@ -29,6 +29,8 @@
 /* Protocol data structures */
 #include "../../src/fbserver-proto.h"
 
+#include "keycode_converter.h"
+
 class KiwiInstance : public pp::Instance {
 public:
     explicit KiwiInstance(PP_Instance instance): pp::Instance(instance) {}
@@ -68,7 +70,8 @@ public:
                 if (pos2 != std::string::npos) {
                     int width = stoi(message.substr(pos+1, pos2-pos-1));
                     int height = stoi(message.substr(pos2+1));
-                    ChangeResolution(width*scale_, height*scale_);
+                    ChangeResolution(width*scale_*view_css_scale_ + 0.5,
+                                     height*scale_*view_css_scale_ + 0.5);
                 }
             } else if (type == "display") {
                 int display = stoi(message.substr(pos+1));
@@ -135,6 +138,17 @@ private:
         return Message(this, "status", false);
     }
 
+    /* Sends a warning message to Javascript */
+    Message WarningMessage() {
+        return Message(this, "warning", false);
+    }
+
+    /* Sends an error message to Javascript: all errors are fatal and a
+     * disconnect message will be sent soon after. */
+    Message ErrorMessage() {
+        return Message(this, "error", false);
+    }
+
     /* Sends a logging message to Javascript */
     Message LogMessage(int level) {
         if (level <= debug_) {
@@ -148,9 +162,10 @@ private:
         }
     }
 
-    /* Sends a resize message to Javascript */
-    void ResizeMessage(int width, int height) {
-        Message(this, "resize", false) << width << "/" << height;
+    /* Sends a resize message to Javascript, divide width & height by scale */
+    void ResizeMessage(int width, int height, float scale) {
+        Message(this, "resize", false) << (int)(width/scale + 0.5) << "/"
+                                       << (int)(height/scale + 0.5);
     }
 
     /* Sends a control message to Javascript
@@ -165,25 +180,33 @@ private:
      * Parameter is ignored: used for callbacks */
     void SocketConnect(int32_t /*result*/ = 0) {
         if (display_ < 0) {
-            LogMessage(-1) << "SocketConnect: No display defined yet.";
+            ErrorMessage() << "SocketConnect: No display defined yet.";
             return;
         }
 
         std::ostringstream url;
         url << "ws://localhost:" << (PORT_BASE + display_) << "/";
-        websocket_.Connect(pp::Var(url.str()), NULL, 0,
-                           callback_factory_.NewCallback(
-                               &KiwiInstance::OnSocketConnectCompletion));
+        websocket_.reset(new pp::WebSocket(this));
+        websocket_->Connect(pp::Var(url.str()), NULL, 0,
+                            callback_factory_.NewCallback(
+                                &KiwiInstance::OnSocketConnectCompletion));
         StatusMessage() << "Connecting...";
     }
 
     /* Called when WebSocket is connected (or failed to connect) */
     void OnSocketConnectCompletion(int32_t result) {
         if (result != PP_OK) {
-            StatusMessage() << "Connection failed ("
-                            << result << "), retrying...";
-            pp::Module::Get()->core()->CallOnMainThread(1000,
-                callback_factory_.NewCallback(&KiwiInstance::SocketConnect));
+            retry_++;
+            if (retry_ < kMaxRetry) {
+                StatusMessage() << "Connection failed with code " << result
+                                << ", " << retry_ << " attempt(s). Retrying...";
+                pp::Module::Get()->core()->CallOnMainThread(1000,
+                   callback_factory_.NewCallback(&KiwiInstance::SocketConnect));
+            } else {
+                ErrorMessage() << "Connection failed (code: " << result << ").";
+                ControlMessage("disconnected", "Connection failed");
+            }
+
             return;
         }
 
@@ -196,7 +219,7 @@ private:
 
     /* Closes the WebSocket connection. */
     void SocketClose(const std::string& reason) {
-        websocket_.Close(0, pp::Var(reason),
+        websocket_->Close(0, pp::Var(reason),
             callback_factory_.NewCallback(&KiwiInstance::OnSocketClosed));
     }
 
@@ -218,7 +241,7 @@ private:
         if (length == target)
             return true;
 
-        LogMessage(-1) << "Invalid " << type << " request (" << length
+        ErrorMessage() << "Invalid " << type << " request (" << length
                        << " != " << target << ").";
         return false;
     }
@@ -226,13 +249,26 @@ private:
     /* Receives and handles a version request */
     bool SocketParseVersion(const char* data, int datalen) {
         if (connected_) {
-            LogMessage(-1) << "Got a version while connected?!?";
+            ErrorMessage() << "Received a version while already connected.";
             return false;
         }
-        if (strcmp(data, VERSION)) {
-            LogMessage(-1) << "Invalid version received (" << data << ").";
-            return false;
+
+        server_version_ = data;
+
+        if (server_version_ != VERSION) {
+            /* TODO: Remove VF1 compatiblity */
+            if (server_version_ == "VF1") {
+                WarningMessage() << "Outdated server version ("
+                                 << server_version_ << "), expecting " << VERSION
+                                 << ". Please update your chroot.";
+            } else {
+                ErrorMessage() << "Invalid server version ("
+                               << server_version_ << "), expecting " << VERSION
+                               << ". Please update your chroot.";
+                return false;
+            }
         }
+
         connected_ = true;
         SocketSend(pp::Var("VOK"), false);
         ControlMessage("connected", "Version received");
@@ -288,7 +324,7 @@ private:
     /* Receives and handles a cursor_reply request */
     bool SocketParseCursor(const char* data, int datalen) {
         if (datalen < sizeof(struct cursor_reply)) {
-            LogMessage(-1) << "Invalid cursor_reply packet (" << datalen
+            ErrorMessage() << "Invalid cursor_reply packet (" << datalen
                            << " < " << sizeof(struct cursor_reply) << ").";
             return false;
         }
@@ -336,7 +372,7 @@ private:
             return false;
         struct resolution* r = (struct resolution*)data;
         /* Tell Javascript so that it can center us on the page */
-        ResizeMessage(r->width/scale_, r->height/scale_);
+        ResizeMessage(r->width, r->height, scale_*view_css_scale_);
         force_refresh_ = true;
         return true;
     }
@@ -351,6 +387,7 @@ private:
             /* Not fatal: just wait for next call */
             return;
         } else if (result != PP_OK) {
+            /* FIXME: Receive error is "normal" when fbserver exits. */
             LogMessage(-1) << "Receive error.";
             SocketClose("Receive error.");
             return;
@@ -396,12 +433,12 @@ private:
                 if (SocketParseResolution(data, datalen)) return;
                 break;
             default:
-                LogMessage(-1) << "Invalid request. First char: "
+                ErrorMessage() << "Invalid request. First char: "
                                << (int)data[0];
                 /* Fall-through: disconnect. */
             }
         } else {
-            LogMessage(-1) << "Got some packet before version...";
+            ErrorMessage() << "Got some packet before version...";
         }
 
         SocketClose("Invalid payload.");
@@ -410,7 +447,7 @@ private:
     /* Asks to receive the next WebSocket frame
      * Parameter is ignored: used for callbacks */
     void SocketReceive(int32_t /*result*/ = 0) {
-        websocket_.ReceiveMessage(&receive_var_, callback_factory_.NewCallback(
+        websocket_->ReceiveMessage(&receive_var_, callback_factory_.NewCallback(
                 &KiwiInstance::OnSocketReceiveCompletion));
     }
 
@@ -430,18 +467,19 @@ private:
             mm->x = mouse_pos_.x();
             mm->y = mouse_pos_.y();
             array_buffer.Unmap();
-            websocket_.SendMessage(array_buffer);
+            websocket_->SendMessage(array_buffer);
             pending_mouse_move_ = false;
         }
 
-        websocket_.SendMessage(var);
+        websocket_->SendMessage(var);
     }
 
     /** UI functions **/
 public:
     /* Called when the NaCl module view changes (size, visibility) */
     virtual void DidChangeView(const pp::View& view) {
-        view_scale_ = view.GetDeviceScale();
+        view_device_scale_ = view.GetDeviceScale();
+        view_css_scale_ = view.GetCSSScale();
         view_rect_ = view.GetRect();
         InitContext();
     }
@@ -452,73 +490,79 @@ public:
             event.GetType() == PP_INPUTEVENT_TYPE_KEYUP) {
             pp::KeyboardInputEvent key_event(event);
 
-            uint32_t keycode = key_event.GetKeyCode();
+            uint32_t jskeycode = key_event.GetKeyCode();
             std::string keystr = key_event.GetCode().AsString();
-            uint32_t keysym = KeyCodeToKeySym(keycode, keystr);
             bool down = event.GetType() == PP_INPUTEVENT_TYPE_KEYDOWN;
 
-            LogMessage(keysym == 0 ? 0 : 1)
-                << "Key " << (down ? "DOWN" : "UP")
-                << ": C:" << keystr
-                << "/KC:" << std::hex << keycode
-                << "/KS:" << std::hex << keysym
-                << (keysym == 0 ? " (KEY UNKNOWN!)" : "")
-                << " searchstate:" << search_state_;
-
-            if (keysym == 0) {
-                return PP_TRUE;
-            }
-
-            if (keycode == 183) {  /* Fullscreen => toggle fullscreen */
+            if (jskeycode == 183) {  /* Fullscreen => toggle fullscreen */
                 if (!down)
                     ControlMessage("state", "fullscreen");
                 return PP_TRUE;
-            } else if (keycode == 182) {  /* Page flipper => minimize window */
+            } else if (jskeycode == 182) {  /* Page flipper => minimize window */
                 if (!down)
                     ControlMessage("state", "hide");
+                return PP_TRUE;
+            }
+
+            /* TODO: Reverse Search key translation when appropriate */
+            uint8_t keycode = KeyCodeConverter::GetCode(keystr, false);
+            /* TODO: Remove VF1 compatibility */
+            uint32_t keysym = 0;
+            if (server_version_ == "VF1")
+                keysym = KeyCodeToKeySym(jskeycode, keystr);
+
+            LogMessage(keycode == 0 ? 0 : 1)
+                << "Key " << (down ? "DOWN" : "UP")
+                << ": C:" << keystr
+                << ", JSKC:" << std::hex << jskeycode
+                << " => KC:" << (int)keycode
+                << (keycode == 0 ? " (KEY UNKNOWN!)" : "")
+                << " searchstate:" << search_state_;
+
+            if (keycode == 0 && keysym == 0) {
                 return PP_TRUE;
             }
 
             /* We delay sending Super-L, and only "press" it on mouse clicks and
              * letter keys (a-z). This way, Home (Search+Left) appears without
              * modifiers (instead of Super_L+Home) */
-            /* FIXME: NumpadDecimal is a dirty hack for broken freon,
-               see http://crbug.com/425156 */
-            if (keysym == kSUPER_L && (keystr == "OSLeft" ||
-                                       keystr == "NumpadDecimal")) {
+            if (keystr == "OSLeft") {
                 if (down) {
                     search_state_ = kSearchUpFirst;
                 } else {
                     if (search_state_ == kSearchUpFirst) {
                         /* No other key was pressed: press+release */
-                        SendKey(kSUPER_L, 1);
-                        SendKey(kSUPER_L, 0);
+                        SendSearchKey(1);
+                        SendSearchKey(0);
                     } else if (search_state_ == kSearchDown) {
-                        SendKey(kSUPER_L, 0);
+                        SendSearchKey(0);
                     }
                     search_state_ = kSearchInactive;
                 }
                 return PP_TRUE;  /* Ignore key */
             }
 
-            if (keycode >= 65 && keycode <= 90) {  /* letter */
+            if (jskeycode >= 65 && jskeycode <= 90) {  /* letter */
                 /* Search is active, send Super_L if needed */
                 if (down && (search_state_ == kSearchUpFirst ||
                              search_state_ == kSearchUp)) {
-                    SendKey(kSUPER_L, 1);
+                    SendSearchKey(1);
                     search_state_ = kSearchDown;
                 }
             } else {  /* non-letter */
                 /* Release Super_L if needed */
                 if (search_state_ == kSearchDown) {
-                    SendKey(kSUPER_L, 0);
+                    SendSearchKey(0);
                     search_state_ = kSearchUp;
                 } else if (search_state_ == kSearchUpFirst) {
                     /* Switch from UpFirst to Up */
                     search_state_ = kSearchUp;
                 }
             }
-            SendKey(keysym, down ? 1 : 0);
+            if (server_version_ == "VF1")
+                SendKeySym(keysym, down ? 1 : 0);
+            else
+                SendKeyCode(keycode, down ? 1 : 0);
         } else if (event.GetType() == PP_INPUTEVENT_TYPE_MOUSEDOWN ||
                    event.GetType() == PP_INPUTEVENT_TYPE_MOUSEUP   ||
                    event.GetType() == PP_INPUTEVENT_TYPE_MOUSEMOVE) {
@@ -674,13 +718,15 @@ private:
         if (view_rect_.width() <= 0 || view_rect_.height() <= 0)
             return;
 
-        scale_ = hidpi_ ? view_scale_ : 1.0f;
+        scale_ = hidpi_ ? view_device_scale_ : 1.0f;
         pp::Size new_size = pp::Size(view_rect_.width()  * scale_,
         			     view_rect_.height() * scale_);
 
         LogMessage(0) << "InitContext "
                       << new_size.width() << "x" << new_size.height()
-                      << "s" << scale_;
+                      << "s" << scale_
+                      << " (device scale: " << view_device_scale_
+                      << ", zoom level: " << view_css_scale_ << ")";
 
         const bool kIsAlwaysOpaque = true;
         context_ = pp::Graphics2D(this, new_size, kIsAlwaysOpaque);
@@ -709,12 +755,13 @@ private:
             array_buffer.Unmap();
             SocketSend(array_buffer, false);
         } else {  /* Just assume we can take up the space */
-            ResizeMessage(width/scale_, height/scale_);
+            ResizeMessage(width, height, scale_*view_css_scale_);
         }
     }
 
     /* Converts "IE"/JavaScript keycode to X11 KeySym.
-     * See http://unixpapa.com/js/key.html */
+     * See http://unixpapa.com/js/key.html
+     * TODO: Drop support for VF1 */
     uint32_t KeyCodeToKeySym(uint32_t keycode, const std::string& code) {
         if (keycode >= 65 && keycode <= 90)  /* A to Z */
             return keycode + 32;
@@ -754,7 +801,7 @@ private:
         case 42:  return 0xff61;  // print screen
         case 45:  return 0xff63;  // insert
         case 46:  return 0xffff;  // delete
-        case 91:  return kSUPER_L; // super
+        case 91:  return 0xffeb;  // super
         case 106: return 0xffaa;  // num multiply
         case 107: return 0xffab;  // num plus
         case 109: return 0xffad;  // num minus
@@ -804,7 +851,7 @@ private:
 
         if (down && (search_state_ == kSearchUpFirst ||
                      search_state_ == kSearchUp)) {
-            SendKey(kSUPER_L, 1);
+            SendSearchKey(1);
             search_state_ = kSearchDown;
         }
 
@@ -820,14 +867,38 @@ private:
         SetTargetFPS(kFullFPS);
     }
 
-    /* Sends a key press */
-    void SendKey(uint32_t keysym, int down) {
+    void SendSearchKey(int down) {
+        /* TODO: Drop support for VF1 */
+        if (server_version_ == "VF1")
+            SendKeySym(0xffeb, down);
+        else
+            SendKeyCode(KeyCodeConverter::GetCode("OSLeft", false), down);
+    }
+
+    /* Sends a keysym (VF1) */
+    /* TODO: Drop support for VF1 */
+    void SendKeySym(uint32_t keysym, int down) {
+        struct key_vf1* k;
+        pp::VarArrayBuffer array_buffer(sizeof(*k));
+        k = static_cast<struct key_vf1*>(array_buffer.Map());
+        k->type = 'K';
+        k->down = down;
+        k->keysym = keysym;
+        array_buffer.Unmap();
+        SocketSend(array_buffer, true);
+
+        /* That means we have focus */
+        SetTargetFPS(kFullFPS);
+    }
+
+    /* Sends a keycode */
+    void SendKeyCode(uint8_t keycode, int down) {
         struct key* k;
         pp::VarArrayBuffer array_buffer(sizeof(*k));
         k = static_cast<struct key*>(array_buffer.Map());
         k->type = 'K';
         k->down = down;
-        k->keysym = keysym;
+        k->keycode = keycode;
         array_buffer.Unmap();
         SocketSend(array_buffer, true);
 
@@ -957,27 +1028,29 @@ private:
 
 private:
     /* Constants */
-    /* SuperL keycode (search key) */
-    const uint32_t kSUPER_L = 0xffeb;
-
     const int kFullFPS = 30;   /* Maximum fps */
     const int kBlurFPS = 5;    /* fps when window is possibly hidden */
     const int kHiddenFPS = 0;  /* fps when window is hidden */
+
+    const int kMaxRetry = 3;  /* Maximum number of connection attempts */
 
     /* Class members */
     pp::CompletionCallbackFactory<KiwiInstance> callback_factory_{this};
     pp::Graphics2D context_;
     pp::Graphics2D flush_context_;
     pp::Rect view_rect_;
-    float view_scale_ = 1.0f;
+    float view_device_scale_ = 1.0f;
+    float view_css_scale_ = 1.0f;
     pp::Size size_;
     float scale_ = 1.0f;
 
     pp::ImageData image_data_;
     int k_ = 0;
 
-    pp::WebSocket websocket_{this};
+    std::unique_ptr<pp::WebSocket> websocket_;
+    int retry_ = 0;
     bool connected_ = false;
+    std::string server_version_ = "";
     bool screen_flying_ = false;
     pp::Var receive_var_;
     int target_fps_ = kFullFPS;
