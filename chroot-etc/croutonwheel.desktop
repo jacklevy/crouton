@@ -1,6 +1,0 @@
-[Desktop Entry]
-Name=croutonwheel
-Exec=/usr/local/bin/croutonwheel-autostart
-Terminal=false
-Type=Application
-NoDisplay=true

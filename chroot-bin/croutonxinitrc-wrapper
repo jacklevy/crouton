@@ -70,7 +70,7 @@ if hash croutonclip 2>/dev/null; then
 fi
 
 # Pass through the host cursor and correct mousewheels on xephyr
-if [ "$XMETHOD" = 'xephyr' ]; then
+if [ "$XMETHOD" = 'xephyr' ] || [ "$XMETHOD" = 'xorg' -a -L /etc/crouton/cmt ]; then
     host-x11 croutoncursor "$DISPLAY" &
     if [ -z "$CROUTON_WHEEL_PARAMS" -a -r "$HOME/.croutonwheel" ]; then
         CROUTON_WHEEL_PARAMS="`head -n1 "$HOME/.croutonwheel"`"
